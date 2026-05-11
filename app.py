@@ -107,101 +107,12 @@ div[data-testid="stMetric"] {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-ROW_WITH_NAME = re.compile(
-    r"^(?P<name>.*?)\s+(?P<room>\d{3,5})\s+"
-    r"(?P<arr>\d{2}-\d{2}-\d{4})\s+"
-    r"(?P<dep>\d{2}-\d{2}-\d{4})\s+"
-    r"(?P<guests>\d+)$"
-)
-
-ROW_NO_NAME = re.compile(
-    r"^(?P<room>\d{3,5})\s+"
-    r"(?P<arr>\d{2}-\d{2}-\d{4})\s+"
-    r"(?P<dep>\d{2}-\d{2}-\d{4})\s+"
-    r"(?P<guests>\d+)$"
-)
-
-IGNORE_STARTS = (
-    "Guest Name",
-    "Breakfast And Packages",
-    "Bristol Grand Hotel",
-    "Date Range",
-    "Report Run",
-    "User:",
-    "Summary By",
-    "Date Day",
-    "Package",
-    "Totals",
-)
-
-IGNORE_PATTERNS = (
-    re.compile(r"^ENBSL\d+$", re.I),
-    re.compile(r"^By Sunday$", re.I),
-)
-
-
-def clean_name(name: str) -> str:
-    name = (name or "").replace("\ufffe", "-")
-    name = re.sub(r"\s+", " ", name).strip()
-    name = re.sub(r"^(ENBSL\d+\s*)+", "", name, flags=re.I).strip()
-    return name
-
-
-def should_ignore(line: str) -> bool:
-    line = line.strip()
-    if not line:
-        return True
-    if any(line.startswith(x) for x in IGNORE_STARTS):
-        return True
-    if any(p.match(line) for p in IGNORE_PATTERNS):
-        return True
-    return False
-
-
-def join_multiline_names(rows):
-    """
-    Fixes the common hotel PDF extraction problem:
-    a continuation name line gets attached to the next room.
-    Example:
-    106 = MR/MRS. MS PAULINE
-    108 = THOMPSON JOANNA GREW
-
-    This changes it to:
-    106 = MR/MRS. MS PAULINE THOMPSON
-    108 = JOANNA GREW
-    """
-    prefixes = ("MR/MRS.", "MR.", "MRS.", "MS.", "MISS", "DR.")
-    fixed = []
-
-    for row in rows:
-        row = row.copy()
-        name = row["Guest Name"].strip()
-
-        if fixed:
-            previous = fixed[-1]
-            previous_name = previous["Guest Name"].strip()
-            parts = name.split()
-
-            previous_looks_incomplete = (
-                previous_name.startswith(prefixes)
-                and "/" not in previous_name
-                and len(previous_name.split()) <= 4
-            )
-
-            first_part_looks_surname = (
-                len(parts) >= 2
-                and parts[0].isupper()
-                and parts[0] not in {"MR", "MRS", "MS", "DR"}
-                and not name.startswith(prefixes)
-            )
-
-            if previous_looks_incomplete and first_part_looks_surname:
-                previous["Guest Name"] = clean_name(previous_name + " " + parts[0])
-                row["Guest Name"] = clean_name(" ".join(parts[1:]))
-
-        fixed.append(row)
-
-    return fixed
+def clean_cell(value: str) -> str:
+    value = value or ""
+    value = value.replace("\ufffe", "-")
+    value = value.replace("\n", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 @st.cache_data(show_spinner=False)
@@ -210,51 +121,36 @@ def parse_breakfast_pdf(file_bytes: bytes) -> pd.DataFrame:
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
-            name_buffer = []
+            tables = page.extract_tables()
 
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
+            for table in tables:
+                for raw_row in table:
+                    if not raw_row or len(raw_row) < 5:
+                        continue
 
-                if line.startswith("Summary By"):
-                    break
+                    name = clean_cell(raw_row[0])
+                    room = clean_cell(raw_row[1])
+                    guests = clean_cell(raw_row[4])
 
-                if should_ignore(line):
-                    continue
+                    # This prevents report header text such as "Report Run Date"
+                    # being treated as a guest name.
+                    if not re.fullmatch(r"\d{3,5}", room):
+                        continue
 
-                match = ROW_WITH_NAME.match(line)
-                if match:
-                    full_name = clean_name(" ".join(name_buffer + [match.group("name")]))
-                    if full_name:
-                        rows.append({
-                            "Room Number": str(match.group("room")),
-                            "Guest Name": full_name,
-                            "Total Guests": int(match.group("guests")),
-                            "Checked In": False,
-                            "Check-in Time": "",
-                        })
-                    name_buffer = []
-                    continue
+                    if not re.fullmatch(r"\d+", guests):
+                        continue
 
-                match = ROW_NO_NAME.match(line)
-                if match and name_buffer:
-                    full_name = clean_name(" ".join(name_buffer))
-                    if full_name:
-                        rows.append({
-                            "Room Number": str(match.group("room")),
-                            "Guest Name": full_name,
-                            "Total Guests": int(match.group("guests")),
-                            "Checked In": False,
-                            "Check-in Time": "",
-                        })
-                    name_buffer = []
-                    continue
+                    if not name or name.lower() == "guest name":
+                        continue
 
-                # Keep only likely name continuation lines.
-                if not re.search(r"\d{2}-\d{2}-\d{4}", line):
-                    name_buffer.append(line)
+                    rows.append({
+                        "Room Number": room,
+                        "Guest Name": name,
+                        "Total Guests": int(guests),
+                        "Checked In": False,
+                        "Check-in Time": "",
+                    })
 
-    rows = join_multiline_names(rows)
     df = pd.DataFrame(rows)
 
     if df.empty:
