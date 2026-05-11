@@ -5,7 +5,6 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import pdfplumber
-from PIL import Image, ImageDraw, ImageFont
 
 
 st.set_page_config(
@@ -108,112 +107,156 @@ div[data-testid="stMetric"] {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-DATE_RE = re.compile(r"\d{2}-\d{2}-\d{4}")
-ROOM_RE = re.compile(r"^\d{3,5}$")
+ROW_WITH_NAME = re.compile(
+    r"^(?P<name>.*?)\s+(?P<room>\d{3,5})\s+"
+    r"(?P<arr>\d{2}-\d{2}-\d{4})\s+"
+    r"(?P<dep>\d{2}-\d{2}-\d{4})\s+"
+    r"(?P<guests>\d+)$"
+)
+
+ROW_NO_NAME = re.compile(
+    r"^(?P<room>\d{3,5})\s+"
+    r"(?P<arr>\d{2}-\d{2}-\d{4})\s+"
+    r"(?P<dep>\d{2}-\d{2}-\d{4})\s+"
+    r"(?P<guests>\d+)$"
+)
+
+IGNORE_STARTS = (
+    "Guest Name",
+    "Breakfast And Packages",
+    "Bristol Grand Hotel",
+    "Date Range",
+    "Report Run",
+    "User:",
+    "Summary By",
+    "Date Day",
+    "Package",
+    "Totals",
+)
+
+IGNORE_PATTERNS = (
+    re.compile(r"^ENBSL\d+$", re.I),
+    re.compile(r"^By Sunday$", re.I),
+)
 
 
-def clean_name(value: str) -> str:
-    value = value or ""
-    value = value.replace("\ufffe", "-")
-    value = value.replace("\n", " ")
-    value = re.sub(r"\s+", " ", value).strip()
-    value = re.sub(r"^(ENBSL\d+\s*)+", "", value, flags=re.I).strip()
-    return value
+def clean_name(name: str) -> str:
+    name = (name or "").replace("\ufffe", "-")
+    name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"^(ENBSL\d+\s*)+", "", name, flags=re.I).strip()
+    return name
 
 
-def parse_table_rows_with_lines(page):
-    """Uses PDF column positions, so multi-line names stay in the same room row."""
-    words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
-    if not words:
-        return []
+def should_ignore(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return True
+    if any(line.startswith(x) for x in IGNORE_STARTS):
+        return True
+    if any(p.match(line) for p in IGNORE_PATTERNS):
+        return True
+    return False
 
-    # Group words into visual text lines.
-    lines = {}
-    for w in words:
-        top_key = round(float(w["top"]) / 3) * 3
-        lines.setdefault(top_key, []).append(w)
 
-    visual_lines = []
-    for top in sorted(lines):
-        ws = sorted(lines[top], key=lambda x: x["x0"])
-        text = " ".join(w["text"] for w in ws)
-        visual_lines.append({
-            "top": top,
-            "text": text,
-            "words": ws,
-            "name": " ".join(w["text"] for w in ws if w["x0"] < 180),
-            "room": " ".join(w["text"] for w in ws if 180 <= w["x0"] < 280),
-            "arrival": " ".join(w["text"] for w in ws if 280 <= w["x0"] < 430),
-            "departure": " ".join(w["text"] for w in ws if 430 <= w["x0"] < 570),
-            "guests": " ".join(w["text"] for w in ws if w["x0"] >= 570),
-        })
+def join_multiline_names(rows):
+    """
+    Fixes the common hotel PDF extraction problem:
+    a continuation name line gets attached to the next room.
+    Example:
+    106 = MR/MRS. MS PAULINE
+    108 = THOMPSON JOANNA GREW
 
-    rows = []
-    current_name_parts = []
-    current_room = None
-    current_guests = None
-    current_arrival = ""
-    current_departure = ""
-    in_table = False
+    This changes it to:
+    106 = MR/MRS. MS PAULINE THOMPSON
+    108 = JOANNA GREW
+    """
+    prefixes = ("MR/MRS.", "MR.", "MRS.", "MS.", "MISS", "DR.")
+    fixed = []
 
-    for line in visual_lines:
-        text = line["text"].strip()
+    for row in rows:
+        row = row.copy()
+        name = row["Guest Name"].strip()
 
-        if "Guest Name" in text and "Room Number" in text:
-            in_table = True
-            continue
+        if fixed:
+            previous = fixed[-1]
+            previous_name = previous["Guest Name"].strip()
+            parts = name.split()
 
-        if not in_table:
-            continue
+            previous_looks_incomplete = (
+                previous_name.startswith(prefixes)
+                and "/" not in previous_name
+                and len(previous_name.split()) <= 4
+            )
 
-        if text.startswith("Totals") or text.startswith("Summary By"):
-            break
+            first_part_looks_surname = (
+                len(parts) >= 2
+                and parts[0].isupper()
+                and parts[0] not in {"MR", "MRS", "MS", "DR"}
+                and not name.startswith(prefixes)
+            )
 
-        name_part = clean_name(line["name"])
-        room_text = re.sub(r"\D", "", line["room"])
-        guests_text = re.sub(r"\D", "", line["guests"])
+            if previous_looks_incomplete and first_part_looks_surname:
+                previous["Guest Name"] = clean_name(previous_name + " " + parts[0])
+                row["Guest Name"] = clean_name(" ".join(parts[1:]))
 
-        # If this line has a room number, it starts a new row.
-        if room_text and ROOM_RE.match(room_text):
-            if current_room and current_name_parts:
-                rows.append({
-                    "Room Number": current_room,
-                    "Guest Name": clean_name(" ".join(current_name_parts)),
-                    "Total Guests": int(current_guests or 1),
-                    "Checked In": False,
-                    "Check-in Time": "",
-                })
+        fixed.append(row)
 
-            current_name_parts = [name_part] if name_part else []
-            current_room = room_text
-            current_guests = guests_text or "1"
-            current_arrival = line["arrival"]
-            current_departure = line["departure"]
-        else:
-            # Continuation line for the same guest name, e.g. THOMPSON or PORTERBROOK.
-            if current_room and name_part and not DATE_RE.search(text):
-                current_name_parts.append(name_part)
-
-    if current_room and current_name_parts:
-        rows.append({
-            "Room Number": current_room,
-            "Guest Name": clean_name(" ".join(current_name_parts)),
-            "Total Guests": int(current_guests or 1),
-            "Checked In": False,
-            "Check-in Time": "",
-        })
-
-    return rows
+    return fixed
 
 
 @st.cache_data(show_spinner=False)
 def parse_breakfast_pdf(file_bytes: bytes) -> pd.DataFrame:
-    all_rows = []
+    rows = []
+
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            all_rows.extend(parse_table_rows_with_lines(page))
+            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            name_buffer = []
 
-    df = pd.DataFrame(all_rows)
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+
+                if line.startswith("Summary By"):
+                    break
+
+                if should_ignore(line):
+                    continue
+
+                match = ROW_WITH_NAME.match(line)
+                if match:
+                    full_name = clean_name(" ".join(name_buffer + [match.group("name")]))
+                    if full_name:
+                        rows.append({
+                            "Room Number": str(match.group("room")),
+                            "Guest Name": full_name,
+                            "Total Guests": int(match.group("guests")),
+                            "Checked In": False,
+                            "Check-in Time": "",
+                        })
+                    name_buffer = []
+                    continue
+
+                match = ROW_NO_NAME.match(line)
+                if match and name_buffer:
+                    full_name = clean_name(" ".join(name_buffer))
+                    if full_name:
+                        rows.append({
+                            "Room Number": str(match.group("room")),
+                            "Guest Name": full_name,
+                            "Total Guests": int(match.group("guests")),
+                            "Checked In": False,
+                            "Check-in Time": "",
+                        })
+                    name_buffer = []
+                    continue
+
+                # Keep only likely name continuation lines.
+                if not re.search(r"\d{2}-\d{2}-\d{4}", line):
+                    name_buffer.append(line)
+
+    rows = join_multiline_names(rows)
+    df = pd.DataFrame(rows)
+
     if df.empty:
         return df
 
@@ -247,73 +290,6 @@ def make_excel_report(df: pd.DataFrame) -> bytes:
                 max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
                 sheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 3, 45)
 
-    return output.getvalue()
-
-
-def make_report_image(df: pd.DataFrame) -> bytes:
-    checked = df[df["Checked In"]]
-    not_checked = df[~df["Checked In"]]
-
-    total_guests = int(df["Total Guests"].sum())
-    checked_guests = int(checked["Total Guests"].sum())
-    not_checked_guests = int(not_checked["Total Guests"].sum())
-
-    width = 1200
-    row_h = 34
-    max_rows = min(len(not_checked), 40)
-    height = 330 + max_rows * row_h
-
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-
-    try:
-        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 42)
-        header_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
-        body_font = ImageFont.truetype("DejaVuSans.ttf", 24)
-        small_font = ImageFont.truetype("DejaVuSans.ttf", 20)
-    except Exception:
-        title_font = header_font = body_font = small_font = None
-
-    y = 35
-    draw.text((40, y), "Breakfast Check-in Report", fill="black", font=title_font)
-    y += 70
-    draw.text((40, y), f"Generated: {datetime.now().strftime('%d-%m-%Y %H:%M')}", fill="black", font=small_font)
-
-    y += 55
-    cards = [
-        ("Total guests", total_guests),
-        ("Guests checked in", checked_guests),
-        ("Guests not checked in", not_checked_guests),
-    ]
-    x = 40
-    for label, value in cards:
-        draw.rounded_rectangle((x, y, x + 340, y + 105), radius=18, outline="#cbd5e1", width=2)
-        draw.text((x + 22, y + 18), label, fill="#334155", font=small_font)
-        draw.text((x + 22, y + 50), str(value), fill="black", font=header_font)
-        x += 375
-
-    y += 150
-    draw.text((40, y), "Not checked in", fill="black", font=header_font)
-    y += 45
-    draw.text((40, y), "Room", fill="#334155", font=body_font)
-    draw.text((170, y), "Guest Name", fill="#334155", font=body_font)
-    draw.text((930, y), "Guests", fill="#334155", font=body_font)
-    y += 35
-    draw.line((40, y, 1120, y), fill="#cbd5e1", width=2)
-    y += 12
-
-    for _, row in not_checked.head(max_rows).iterrows():
-        draw.text((40, y), str(row["Room Number"]), fill="black", font=small_font)
-        draw.text((170, y), str(row["Guest Name"])[:60], fill="black", font=small_font)
-        draw.text((930, y), str(int(row["Total Guests"])), fill="black", font=small_font)
-        y += row_h
-
-    if len(not_checked) > max_rows:
-        y += 10
-        draw.text((40, y), f"...and {len(not_checked) - max_rows} more rooms not checked in", fill="#334155", font=small_font)
-
-    output = BytesIO()
-    img.save(output, format="PNG")
     return output.getvalue()
 
 
@@ -382,7 +358,7 @@ if st.session_state.guest_df is None:
 df = st.session_state.guest_df
 
 if df.empty:
-    st.error("No guest rows were found. Check the PDF format.")
+    st.error("No guest rows were found. This PDF format may be different from the breakfast report format.")
     st.stop()
 
 total_rooms = len(df)
@@ -527,30 +503,19 @@ with r2:
 
 excel_data = make_excel_report(df)
 csv_data = df.to_csv(index=False).encode("utf-8")
-image_data = make_report_image(df)
 
 if st.session_state.breakfast_ended:
-    st.success("Breakfast ended. Download the final report below.")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "⬇️ Download final Excel report",
-            data=excel_data,
-            file_name=f"breakfast_checkin_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "⬇️ Download report image",
-            data=image_data,
-            file_name=f"breakfast_checkin_report_{datetime.now().strftime('%Y%m%d_%H%M')}.png",
-            mime="image/png",
-            use_container_width=True,
-        )
+    st.success("Breakfast ended. Download the final Excel report below.")
+    st.download_button(
+        "⬇️ Download final Excel report",
+        data=excel_data,
+        file_name=f"breakfast_checkin_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
 
-d1, d2, d3, d4 = st.columns([1, 1, 1, 1])
+d1, d2, d3 = st.columns([1, 1, 1])
 with d1:
     st.download_button(
         "Download Excel report",
@@ -568,12 +533,4 @@ with d2:
         use_container_width=True,
     )
 with d3:
-    st.download_button(
-        "Download image report",
-        data=image_data,
-        file_name="breakfast_checkin_report.png",
-        mime="image/png",
-        use_container_width=True,
-    )
-with d4:
     st.button("Start new breakfast list", use_container_width=True, on_click=start_new_list)
