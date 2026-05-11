@@ -277,7 +277,7 @@ if st.session_state.last_checked_room:
 left, right = st.columns([0.95, 1.35], gap="large")
 
 with left:
-    st.markdown("### Search and check in")
+    #st.markdown("### Search and check in")
 
     with st.form(key=f"room_form_{st.session_state.search_key}", clear_on_submit=True):
         room_input = st.text_input(
