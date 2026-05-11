@@ -17,64 +17,91 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
+:root {
+    --app-card-bg: color-mix(in srgb, var(--background-color) 92%, var(--text-color) 8%);
+    --app-soft-bg: color-mix(in srgb, var(--background-color) 96%, var(--text-color) 4%);
+    --app-border: color-mix(in srgb, var(--text-color) 18%, transparent);
+    --app-muted: color-mix(in srgb, var(--text-color) 68%, transparent);
+    --app-shadow: rgba(0,0,0,0.10);
+    --app-ok-bg: color-mix(in srgb, #22c55e 22%, var(--background-color) 78%);
+    --app-ok-text: color-mix(in srgb, #22c55e 70%, var(--text-color) 30%);
+    --app-wait-bg: color-mix(in srgb, #f59e0b 24%, var(--background-color) 76%);
+    --app-wait-text: color-mix(in srgb, #f59e0b 70%, var(--text-color) 30%);
+}
 .block-container {
     max-width: 1500px;
-    padding-top: 1rem;
+    padding-top: 2.4rem;
     padding-left: 1.5rem;
     padding-right: 1.5rem;
 }
 .main-title {
-    font-size: 2.1rem;
+    font-size: 2.15rem;
     font-weight: 800;
-    margin-bottom: 0.2rem;
+    margin-top: 0.8rem;
+    margin-bottom: 0.25rem;
+    color: var(--text-color);
 }
 .small-muted {
-    color: #6b7280;
+    color: var(--app-muted);
     font-size: 0.95rem;
+    margin-bottom: 0.8rem;
 }
 .card {
-    border: 1px solid #e5e7eb;
+    border: 1px solid var(--app-border);
     border-radius: 18px;
     padding: 18px 20px;
-    background: #ffffff;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+    background: var(--app-card-bg);
+    box-shadow: 0 2px 10px var(--app-shadow);
     margin-bottom: 14px;
+    color: var(--text-color);
 }
 .guest-name {
     font-size: 1.55rem;
     font-weight: 800;
     margin-bottom: 0.2rem;
+    color: var(--text-color);
 }
 .room-number {
     font-size: 1.05rem;
-    color: #374151;
+    color: var(--app-muted);
     font-weight: 600;
 }
 .status-ok {
     display: inline-block;
     padding: 7px 11px;
     border-radius: 999px;
-    background: #dcfce7;
-    color: #166534;
+    background: var(--app-ok-bg);
+    color: var(--app-ok-text);
     font-weight: 700;
 }
 .status-waiting {
     display: inline-block;
     padding: 7px 11px;
     border-radius: 999px;
-    background: #fef3c7;
-    color: #92400e;
+    background: var(--app-wait-bg);
+    color: var(--app-wait-text);
     font-weight: 700;
 }
 div[data-testid="stMetric"] {
-    background: #ffffff;
-    border: 1px solid #e5e7eb;
+    background: var(--app-card-bg);
+    border: 1px solid var(--app-border);
     padding: 12px 14px;
     border-radius: 16px;
-    box-shadow: 0 1px 8px rgba(0,0,0,0.035);
+    box-shadow: 0 1px 8px var(--app-shadow);
 }
 [data-testid="stDataFrame"] {
     border-radius: 14px;
+}
+@media (max-width: 900px) {
+    .block-container {
+        padding-top: 1.8rem;
+        padding-left: 0.7rem;
+        padding-right: 0.7rem;
+    }
+    .main-title {
+        font-size: 1.8rem;
+        margin-top: 0.5rem;
+    }
 }
 </style>
 """
