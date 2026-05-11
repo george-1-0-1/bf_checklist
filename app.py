@@ -10,8 +10,75 @@ import pdfplumber
 st.set_page_config(
     page_title="Breakfast Check-in",
     page_icon="🍳",
-    layout="centered"
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+
+CUSTOM_CSS = """
+<style>
+.block-container {
+    max-width: 1500px;
+    padding-top: 1rem;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+}
+.main-title {
+    font-size: 2.1rem;
+    font-weight: 800;
+    margin-bottom: 0.2rem;
+}
+.small-muted {
+    color: #6b7280;
+    font-size: 0.95rem;
+}
+.card {
+    border: 1px solid #e5e7eb;
+    border-radius: 18px;
+    padding: 18px 20px;
+    background: #ffffff;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+    margin-bottom: 14px;
+}
+.guest-name {
+    font-size: 1.55rem;
+    font-weight: 800;
+    margin-bottom: 0.2rem;
+}
+.room-number {
+    font-size: 1.05rem;
+    color: #374151;
+    font-weight: 600;
+}
+.status-ok {
+    display: inline-block;
+    padding: 7px 11px;
+    border-radius: 999px;
+    background: #dcfce7;
+    color: #166534;
+    font-weight: 700;
+}
+.status-waiting {
+    display: inline-block;
+    padding: 7px 11px;
+    border-radius: 999px;
+    background: #fef3c7;
+    color: #92400e;
+    font-weight: 700;
+}
+div[data-testid="stMetric"] {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    padding: 12px 14px;
+    border-radius: 16px;
+    box-shadow: 0 1px 8px rgba(0,0,0,0.035);
+}
+[data-testid="stDataFrame"] {
+    border-radius: 14px;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 ROOM_ROW_WITH_NAME = re.compile(
@@ -41,10 +108,17 @@ IGNORE_STARTS = (
     "Totals",
 )
 
+IGNORE_EXACT_OR_PATTERN = [
+    re.compile(r"^ENBSL\d+$", re.I),
+    re.compile(r"^By Sunday$", re.I),
+    re.compile(r"^Hotel$", re.I),
+]
+
 
 def clean_name(name: str) -> str:
     name = name.replace("\ufffe", "-")
     name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"^(ENBSL\d+\s*)+", "", name, flags=re.I).strip()
     return name
 
 
@@ -52,222 +126,361 @@ def should_ignore(line: str) -> bool:
     line = line.strip()
     if not line:
         return True
-    return any(line.startswith(x) for x in IGNORE_STARTS)
+    if any(line.startswith(x) for x in IGNORE_STARTS):
+        return True
+    if any(p.match(line) for p in IGNORE_EXACT_OR_PATTERN):
+        return True
+    return False
 
 
-def parse_breakfast_pdf(file) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def parse_breakfast_pdf(file_bytes: bytes) -> pd.DataFrame:
     rows = []
     name_buffer = []
 
-    with pdfplumber.open(file) as pdf:
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+
             for raw_line in text.splitlines():
                 line = raw_line.strip()
                 if should_ignore(line):
                     continue
 
+                if line.startswith("Summary By Date"):
+                    break
+
                 match = ROOM_ROW_WITH_NAME.match(line)
                 if match:
                     inline_name = match.group("name").strip()
                     full_name = clean_name(" ".join(name_buffer + [inline_name]))
-                    rows.append({
-                        "Room Number": str(match.group("room")),
-                        "Guest Name": full_name,
-                        "Arrival Date": match.group("arr"),
-                        "Departure Date": match.group("dep"),
-                        "Total Guests": int(match.group("guests")),
-                    })
+                    if full_name:
+                        rows.append({
+                            "Room Number": str(match.group("room")),
+                            "Guest Name": full_name,
+                            "Total Guests": int(match.group("guests")),
+                            "Checked In": False,
+                            "Check-in Time": "",
+                        })
                     name_buffer = []
                     continue
 
                 match = ROOM_ROW_NO_NAME.match(line)
                 if match and name_buffer:
                     full_name = clean_name(" ".join(name_buffer))
-                    rows.append({
-                        "Room Number": str(match.group("room")),
-                        "Guest Name": full_name,
-                        "Arrival Date": match.group("arr"),
-                        "Departure Date": match.group("dep"),
-                        "Total Guests": int(match.group("guests")),
-                    })
+                    if full_name:
+                        rows.append({
+                            "Room Number": str(match.group("room")),
+                            "Guest Name": full_name,
+                            "Total Guests": int(match.group("guests")),
+                            "Checked In": False,
+                            "Check-in Time": "",
+                        })
                     name_buffer = []
                     continue
 
-                # Likely part of a multi-line guest name.
-                if not re.search(r"\d{2}-\d{2}-\d{4}", line):
+                if not re.search(r"\d{2}-\d{2}-\d{4}", line) and not re.search(r"\b\d{3,5}\b", line):
                     name_buffer.append(line)
 
     df = pd.DataFrame(rows)
-
     if df.empty:
         return df
 
     df = df.drop_duplicates(subset=["Room Number"], keep="first")
-    df["Checked In"] = False
-    df["Check-in Time"] = ""
     return df.sort_values("Room Number").reset_index(drop=True)
 
 
 def make_excel_report(df: pd.DataFrame) -> bytes:
     output = BytesIO()
+
+    checked = df[df["Checked In"]].copy()
+    not_checked = df[~df["Checked In"]].copy()
+
+    summary = pd.DataFrame({
+        "Metric": [
+            "Total rooms",
+            "Rooms checked in",
+            "Rooms not checked in",
+            "Total guests",
+            "Guests checked in",
+            "Guests not checked in",
+        ],
+        "Value": [
+            len(df),
+            len(checked),
+            len(not_checked),
+            int(df["Total Guests"].sum()),
+            int(checked["Total Guests"].sum()),
+            int(not_checked["Total Guests"].sum()),
+        ],
+    })
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        checked = df[df["Checked In"]].copy()
-        not_checked = df[~df["Checked In"]].copy()
-
-        summary = pd.DataFrame({
-            "Metric": [
-                "Total rooms",
-                "Rooms checked in",
-                "Rooms not checked in",
-                "Total guests",
-                "Guests checked in",
-                "Guests not checked in",
-            ],
-            "Value": [
-                len(df),
-                len(checked),
-                len(not_checked),
-                int(df["Total Guests"].sum()),
-                int(checked["Total Guests"].sum()),
-                int(not_checked["Total Guests"].sum()),
-            ]
-        })
-
         summary.to_excel(writer, index=False, sheet_name="Summary")
         checked.to_excel(writer, index=False, sheet_name="Checked In")
         not_checked.to_excel(writer, index=False, sheet_name="Not Checked In")
         df.to_excel(writer, index=False, sheet_name="Full List")
 
+        for sheet in writer.sheets.values():
+            for column_cells in sheet.columns:
+                max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+                sheet.column_dimensions[column_cells[0].column_letter].width = min(max_length + 3, 45)
+
     return output.getvalue()
 
 
-def reset_search_box():
-    st.session_state.room_search = ""
+def check_in_room(room_number: str):
+    df = st.session_state.guest_df
+    matches = df.index[df["Room Number"] == room_number].tolist()
+
+    if not matches:
+        return
+
+    idx = matches[0]
+    if not bool(df.loc[idx, "Checked In"]):
+        st.session_state.guest_df.loc[idx, "Checked In"] = True
+        st.session_state.guest_df.loc[idx, "Check-in Time"] = datetime.now().strftime("%H:%M:%S")
+
+    st.session_state.last_checked_room = room_number
+    st.session_state.selected_room = ""
+    st.session_state.search_key += 1
 
 
-if "guest_df" not in st.session_state:
+def undo_room(room_number: str):
+    df = st.session_state.guest_df
+    matches = df.index[df["Room Number"] == room_number].tolist()
+
+    if not matches:
+        return
+
+    idx = matches[0]
+    st.session_state.guest_df.loc[idx, "Checked In"] = False
+    st.session_state.guest_df.loc[idx, "Check-in Time"] = ""
+    st.session_state.selected_room = room_number
+
+
+def start_new_list():
     st.session_state.guest_df = None
-
-if "last_checked_room" not in st.session_state:
+    st.session_state.selected_room = ""
     st.session_state.last_checked_room = ""
+    st.session_state.search_key += 1
+    st.session_state.breakfast_ended = False
 
 
-st.title("🍳 Breakfast Check-in")
-st.caption("Upload the breakfast PDF once, then search rooms and mark guests as checked in.")
+for key, default in {
+    "guest_df": None,
+    "selected_room": "",
+    "last_checked_room": "",
+    "search_key": 0,
+    "breakfast_ended": False,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-uploaded_pdf = st.file_uploader("Upload breakfast PDF", type=["pdf"])
+
+st.markdown('<div class="main-title">🍳 Breakfast Check-in</div>', unsafe_allow_html=True)
+st.markdown('<div class="small-muted">Upload the PDF once, search by room number, check guests in, then view or download the report.</div>', unsafe_allow_html=True)
+
+uploaded_pdf = st.file_uploader("Upload breakfast PDF", type=["pdf"], label_visibility="collapsed")
 
 if uploaded_pdf is not None and st.session_state.guest_df is None:
     with st.spinner("Reading breakfast list..."):
-        st.session_state.guest_df = parse_breakfast_pdf(uploaded_pdf)
+        st.session_state.guest_df = parse_breakfast_pdf(uploaded_pdf.getvalue())
 
 if st.session_state.guest_df is None:
-    st.info("Upload the PDF to start.")
+    st.info("Upload the breakfast PDF to start.")
     st.stop()
 
 df = st.session_state.guest_df
 
 if df.empty:
-    st.error("No guest rows were found. Try another PDF or check the format.")
+    st.error("No guest rows were found. Check the PDF format.")
     st.stop()
 
 total_rooms = len(df)
 checked_rooms = int(df["Checked In"].sum())
+remaining_rooms = total_rooms - checked_rooms
+
 total_guests = int(df["Total Guests"].sum())
 checked_guests = int(df.loc[df["Checked In"], "Total Guests"].sum())
+remaining_guests = total_guests - checked_guests
 
-a, b, c = st.columns(3)
-a.metric("Rooms checked", f"{checked_rooms}/{total_rooms}")
-b.metric("Guests checked", f"{checked_guests}/{total_guests}")
-c.metric("Remaining rooms", total_rooms - checked_rooms)
-
-st.divider()
-
-room = st.text_input(
-    "Enter room number",
-    key="room_search",
-    placeholder="Example: 106",
-)
-
-room = room.strip()
-
-if room:
-    result = df[df["Room Number"] == room]
-
-    if result.empty:
-        st.warning(f"Room {room} was not found in this breakfast list.")
-    else:
-        row = result.iloc[0]
-        idx = result.index[0]
-
-        status = "✅ Already checked in" if row["Checked In"] else "Not checked in yet"
-
-        st.subheader(f"Room {row['Room Number']}")
-        st.write(f"**Guest name:** {row['Guest Name']}")
-        st.write(f"**Total guests:** {row['Total Guests']}")
-        st.write(f"**Arrival:** {row['Arrival Date']}")
-        st.write(f"**Departure:** {row['Departure Date']}")
-        st.write(f"**Status:** {status}")
-
-        if not row["Checked In"]:
-            if st.button("✅ Check in this room", type="primary"):
-                now = datetime.now().strftime("%H:%M:%S")
-                st.session_state.guest_df.loc[idx, "Checked In"] = True
-                st.session_state.guest_df.loc[idx, "Check-in Time"] = now
-                st.session_state.last_checked_room = room
-                reset_search_box()
-                st.rerun()
-        else:
-            if st.button("Undo check-in"):
-                st.session_state.guest_df.loc[idx, "Checked In"] = False
-                st.session_state.guest_df.loc[idx, "Check-in Time"] = ""
-                reset_search_box()
-                st.rerun()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Guests checked in", f"{checked_guests}/{total_guests}")
+m2.metric("Rooms checked in", f"{checked_rooms}/{total_rooms}")
+m3.metric("Guests remaining", remaining_guests)
+m4.metric("Rooms remaining", remaining_rooms)
 
 if st.session_state.last_checked_room:
     st.success(f"Last checked in: room {st.session_state.last_checked_room}")
 
-st.divider()
+left, right = st.columns([0.95, 1.35], gap="large")
 
-with st.expander("View full list"):
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True
+with left:
+    st.markdown("### Search and check in")
+
+    with st.form(key=f"room_form_{st.session_state.search_key}", clear_on_submit=True):
+        room_input = st.text_input(
+            "Enter room number",
+            placeholder="Example: 106",
+            label_visibility="visible",
+        )
+        submitted = st.form_submit_button("Find room", type="primary", use_container_width=True)
+
+    if submitted:
+        st.session_state.selected_room = room_input.strip()
+
+    selected_room = st.session_state.selected_room.strip()
+
+    if not selected_room:
+        st.markdown(
+            """
+            <div class="card">
+                <b>Ready for next guest.</b><br>
+                Type a room number and press <b>Find room</b>.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        result = df[df["Room Number"] == selected_room]
+
+        if result.empty:
+            st.warning(f"Room {selected_room} was not found.")
+        else:
+            row = result.iloc[0]
+            checked_status = bool(row["Checked In"])
+            status_html = (
+                '<span class="status-ok">Already checked in</span>'
+                if checked_status
+                else '<span class="status-waiting">Not checked in yet</span>'
+            )
+
+            st.markdown(
+                f"""
+                <div class="card">
+                    <div class="room-number">Room {row['Room Number']}</div>
+                    <div class="guest-name">{row['Guest Name']}</div>
+                    <p><b>Total guests:</b> {int(row['Total Guests'])}</p>
+                    <p><b>Status:</b> {status_html}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if not checked_status:
+                st.button(
+                    "✅ Check in",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=check_in_room,
+                    args=(str(row["Room Number"]),),
+                )
+            else:
+                st.button(
+                    "Undo check-in",
+                    use_container_width=True,
+                    on_click=undo_room,
+                    args=(str(row["Room Number"]),),
+                )
+
+with right:
+    st.markdown("### Live breakfast list")
+
+    view_choice = st.radio(
+        "Filter list",
+        ["All", "Checked in", "Not checked in"],
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
-st.subheader("End of breakfast report")
+    if view_choice == "Checked in":
+        list_df = df[df["Checked In"]]
+    elif view_choice == "Not checked in":
+        list_df = df[~df["Checked In"]]
+    else:
+        list_df = df
 
-checked = df[df["Checked In"]]
-not_checked = df[~df["Checked In"]]
+    show_df = list_df[["Room Number", "Guest Name", "Total Guests", "Checked In", "Check-in Time"]].copy()
+    show_df["Checked In"] = show_df["Checked In"].map({True: "✅", False: ""})
 
-st.write(f"**Checked-in rooms:** {len(checked)}")
-st.write(f"**Not checked-in rooms:** {len(not_checked)}")
-st.write(f"**Checked-in guests:** {int(checked['Total Guests'].sum())}")
-st.write(f"**Not checked-in guests:** {int(not_checked['Total Guests'].sum())}")
-
-csv_data = df.to_csv(index=False).encode("utf-8")
-excel_data = make_excel_report(df)
-
-st.download_button(
-    "Download CSV report",
-    data=csv_data,
-    file_name="breakfast_checkin_report.csv",
-    mime="text/csv"
-)
-
-st.download_button(
-    "Download Excel report",
-    data=excel_data,
-    file_name="breakfast_checkin_report.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+    st.dataframe(
+        show_df,
+        use_container_width=True,
+        hide_index=True,
+        height=430,
+    )
 
 st.divider()
 
-if st.button("Start new breakfast list"):
-    st.session_state.guest_df = None
-    st.session_state.last_checked_room = ""
-    reset_search_box()
-    st.rerun()
+st.markdown("## End of breakfast report")
+
+summary_df = pd.DataFrame({
+    "Metric": [
+        "Total rooms",
+        "Rooms checked in",
+        "Rooms not checked in",
+        "Total guests",
+        "Guests checked in",
+        "Guests not checked in",
+    ],
+    "Value": [
+        total_rooms,
+        checked_rooms,
+        remaining_rooms,
+        total_guests,
+        checked_guests,
+        remaining_guests,
+    ],
+})
+
+r1, r2 = st.columns([0.8, 1.2], gap="large")
+
+with r1:
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    if st.button("End breakfast", type="primary", use_container_width=True):
+        st.session_state.breakfast_ended = True
+
+with r2:
+    checked_report = df[df["Checked In"]][["Room Number", "Guest Name", "Total Guests", "Check-in Time"]]
+    not_checked_report = df[~df["Checked In"]][["Room Number", "Guest Name", "Total Guests"]]
+
+    tab1, tab2 = st.tabs(["Checked in", "Not checked in"])
+    with tab1:
+        st.dataframe(checked_report, use_container_width=True, hide_index=True, height=260)
+    with tab2:
+        st.dataframe(not_checked_report, use_container_width=True, hide_index=True, height=260)
+
+excel_data = make_excel_report(df)
+csv_data = df.to_csv(index=False).encode("utf-8")
+
+if st.session_state.breakfast_ended:
+    st.success("Breakfast ended. Download the final Excel report below.")
+    st.download_button(
+        "⬇️ Download final Excel report",
+        data=excel_data,
+        file_name=f"breakfast_checkin_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+d1, d2, d3 = st.columns([1, 1, 1])
+with d1:
+    st.download_button(
+        "Download Excel report",
+        data=excel_data,
+        file_name="breakfast_checkin_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+with d2:
+    st.download_button(
+        "Download CSV report",
+        data=csv_data,
+        file_name="breakfast_checkin_report.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with d3:
+    st.button("Start new breakfast list", use_container_width=True, on_click=start_new_list)
