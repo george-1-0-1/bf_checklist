@@ -1,7 +1,7 @@
 import re
 from io import BytesIO
 from datetime import datetime
-
+from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 import pdfplumber
@@ -199,7 +199,7 @@ def check_in_room(room_number: str):
     idx = matches[0]
     if not bool(df.loc[idx, "Checked In"]):
         st.session_state.guest_df.loc[idx, "Checked In"] = True
-        st.session_state.guest_df.loc[idx, "Check-in Time"] = datetime.now().strftime("%H:%M:%S")
+        st.session_state.guest_df.loc[idx, "Check-in Time"] = datetime.now(ZoneInfo("Europe/London")).strftime("%H:%M:%S")
 
     st.session_state.last_checked_room = room_number
     st.session_state.selected_room = ""
@@ -405,7 +405,7 @@ if st.session_state.breakfast_ended:
     st.download_button(
         "⬇️ Download final Excel report",
         data=excel_data,
-        file_name=f"breakfast_checkin_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        file_name=f"breakfast_checkin_report_{datetime.now(ZoneInfo("Europe/London")).strftime("%H:%M:%S")}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
