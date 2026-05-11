@@ -330,7 +330,7 @@ with left:
 
             if not checked_status:
                 st.button(
-                    "✅ Check in",
+                    "Check in",
                     type="primary",
                     use_container_width=True,
                     on_click=check_in_room,
